@@ -1,4 +1,6 @@
 import copy
+import json
+from datetime import datetime, timezone
 import os
 import yaml
 from pathlib import Path
@@ -21,6 +23,8 @@ class BackupQueue(QObject):
         self.pending = []
         self.active = None
         self.results = {}
+        self.task_ids = {}
+        self.states = {}
         self._task = None
         self.progress.connect(self.update_progress)
 
@@ -30,6 +34,11 @@ class BackupQueue(QObject):
             self.window.statusBar().showMessage('Save backup already queued for ' + game['Name'], 8000)
             return
         self.pending.append((copy.deepcopy(game), copy.deepcopy(action), settings))
+        self.states[identity] = Path(settings['state'])
+        registry = getattr(self.window, 'background_tasks', None)
+        if registry is not None:
+            self.task_ids[identity] = registry.update(title=game['Name'], kind='Save backup', state='Queued',
+                summary='Waiting for the current backup to finish.', retry=lambda: self.add(game, action, settings))
         self.results[identity] = {'status': 'Backup queued', 'cloud': 'Waiting', 'details': 'Waiting for the current backup to finish.'}
         if self.active:
             self.window.statusBar().showMessage('Save backup queued for ' + game['Name'], 8000)
@@ -42,6 +51,7 @@ class BackupQueue(QObject):
         game, action, settings = self.active
         providers = list(self.window.game_providers)
         self.window.statusBar().showMessage('Backing up saves: ' + game['Name'])
+        self.update_progress('Backing up saves…')
         def work():
             import fcntl
             state = Path(settings['state']); state.mkdir(parents=True, exist_ok=True)
@@ -65,11 +75,30 @@ class BackupQueue(QObject):
         self.results[game['Id']] = {'status': message, 'cloud': 'Waiting' if message.startswith('Waiting') else 'In progress',
                                     'details': message}
         self.window.statusBar().showMessage(game['Name'] + ': ' + message)
+        registry = getattr(self.window, 'background_tasks', None)
+        if registry is not None:
+            registry.update(self.task_ids[game['Id']], state='Waiting' if message.startswith('Waiting') else 'Uploading' if message.startswith('Uploading') else 'Running', summary=message)
 
     @pyqtSlot(object)
     def completed(self, result):
         game = self.active[0]
+        result = dict(result, updated=datetime.now(timezone.utc).isoformat(timespec='seconds'))
         self.results[game['Id']] = result
+        state = self.states.get(game['Id'])
+        if state is not None:
+            state.mkdir(parents=True, exist_ok=True)
+            path = state / 'backup-results.json'
+            try:
+                history = json.loads(path.read_text()) if path.exists() else {}
+                history[game['Id']] = result
+                temp = path.with_suffix('.tmp'); temp.write_text(json.dumps(history, indent=2)); temp.chmod(0o600); temp.replace(path)
+            except (OSError, ValueError):
+                import logging
+                logging.exception('Could not record backup result')
+        registry = getattr(self.window, 'background_tasks', None)
+        if registry is not None:
+            registry.update(self.task_ids[game['Id']], state='Failed' if result['status'] == 'Backup failed' else 'Needs attention' if result.get('cloud') in ('Needs attention', 'Upload failed') else 'Complete',
+                summary=result['status'] + ' · Cloud: ' + result.get('cloud', 'Not attempted'), details=result.get('details', ''))
         message = f"{game['Name']}: {result['status']}"
         if result.get('cloud') not in ('Uploaded', 'Disabled', 'Not attempted'):
             message += ' — cloud needs attention (see Save backup status)'
@@ -123,7 +152,9 @@ class Plugin(GenericPlugin):
         self.controller(window).add(launch_game, launch_action, options)
 
     def game_actions(self, window, game):
-        return [('Edit save definition…', lambda: self.edit_definition(window, game)),
+        from .inspection import show_inspection
+        return [('Inspect detected saves…', lambda: show_inspection(self, window, game)),
+                ('Edit save definition…', lambda: self.edit_definition(window, game)),
                 ('Sync save definition from manifest…', lambda: self.sync_definitions(window, [game])),
                 ('Back up saves…', lambda: self.backup(window, game)),
                 ('Restore saves in Ludusavi…', lambda: self.open_ludusavi(window, game)),
@@ -131,7 +162,9 @@ class Plugin(GenericPlugin):
                 ('Save backup status…', lambda: self.show_status(window, game))]
 
     def batch_game_actions(self, window, games):
-        return [('Sync save definitions from manifest…', lambda: self.sync_definitions(window, games))]
+        from .bulk_definitions import edit_definitions
+        return [('Sync save definitions from manifest…', lambda: self.sync_definitions(window, games)),
+                ('Edit selected save definitions…', lambda: edit_definitions(self, window, games))]
 
     def sync_definitions(self, parent, games=None, settings=None):
         window = parent
@@ -160,7 +193,13 @@ class Plugin(GenericPlugin):
                     except OSError:
                         continue
                 return sync_definitions(games, providers, options)
+        registry = getattr(window, 'background_tasks', None)
+        identity = registry.update(title='Sync save definitions', kind='Save definitions', state='Running',
+            summary=f'Scanning {len(games)} games…', retry=lambda: self.sync_definitions(window, games, options)) if registry is not None else None
         task = Task(work)
+        if registry is not None:
+            task.signals.succeeded.connect(lambda result: registry.update(identity, state='Complete', summary=f"Updated {len(result['updated'])} games; skipped {len(result['skipped'])}.", details=json.dumps(result, indent=2)))
+            task.signals.failed.connect(lambda error: registry.update(identity, state='Failed', summary='Save definition sync failed.', details=error))
         task.signals.succeeded.connect(lambda result: window.statusBar().showMessage(
             f"Save definitions synced: {len(result['updated'])}; skipped: {len(result['skipped'])}", 15000))
         task.signals.failed.connect(lambda error: show_warning(window, 'Save definitions', error))
@@ -249,14 +288,26 @@ class Plugin(GenericPlugin):
         dialog = QDialog(window); dialog.setWindowTitle('Save backup — ' + game['Name']); dialog.resize(650, 420)
         layout = QVBoxLayout(dialog)
         summary = QLabel(); layout.addWidget(summary)
-        details = QPlainTextEdit(); details.setReadOnly(True); layout.addWidget(details)
+        details = QPlainTextEdit(); details.setReadOnly(True); details.hide()
+        toggle = QPushButton('Show details'); toggle.setCheckable(True); toggle.toggled.connect(details.setVisible)
+        toggle.toggled.connect(lambda on: toggle.setText('Hide details' if on else 'Show details'))
+        layout.addWidget(toggle)
+        from PyQt6.QtWidgets import QApplication
+        copy_button = QPushButton('Copy log'); copy_button.clicked.connect(lambda: QApplication.clipboard().setText(summary.text() + '\n\n' + details.toPlainText()))
+        layout.addWidget(copy_button); layout.addWidget(details)
         retry = QPushButton('Retry backup'); retry.clicked.connect(lambda: (dialog.accept(), self.backup(window, game)))
         layout.addWidget(retry)
         open_button = QPushButton('Open Ludusavi'); open_button.clicked.connect(lambda: (dialog.accept(), self.open_ludusavi(window, game)))
         layout.addWidget(open_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
         def refresh():
-            result = controller.results.get(game['Id'], {'status': 'No backup recorded in this Playlite session'})
+            result = controller.results.get(game['Id'])
+            if result is None:
+                try:
+                    result = json.loads((Path(self.options()['state']) / 'backup-results.json').read_text()).get(game['Id'])
+                except (OSError, ValueError):
+                    pass
+            result = result or {'status': 'No backup recorded'}
             summary.setText(result['status'] + '\nCloud: ' + result.get('cloud', 'Not attempted'))
             text = result.get('details', '')
             if details.toPlainText() != text:
@@ -313,7 +364,14 @@ class Plugin(GenericPlugin):
         editor.ludusavi_registry = QPlainTextEdit('\n'.join(saved.get('registry', definition.get('registry', []))))
         editor.ludusavi_registry.setMaximumHeight(80)
         editor.installation_form.addRow('Save definition paths', editor.ludusavi_files)
+        editor.ludusavi_confirmed = QCheckBox('I have confirmed these files contain my game progress')
+        editor.ludusavi_confirmed.setChecked(saved.get('progress_confirmed', False))
+        editor.installation_form.addRow(editor.ludusavi_confirmed)
         editor.installation_form.addRow('Save registry keys', editor.ludusavi_registry)
+        for field in (editor.ludusavi_files, editor.ludusavi_registry):
+            field.textChanged.connect(lambda: editor.ludusavi_confirmed.setChecked(False))
+        editor.ludusavi_name.textChanged.connect(lambda: editor.ludusavi_confirmed.setChecked(False))
+        editor.ludusavi_prefix.textChanged.connect(lambda: editor.ludusavi_confirmed.setChecked(False))
         editor.ludusavi_has_definition = bool(definition or 'files' in saved)
 
     def collect_editor(self, editor, game):
@@ -322,7 +380,7 @@ class Plugin(GenericPlugin):
         prefix = editor.ludusavi_prefix.text().strip()
         if prefix and (not Path(prefix).is_absolute() or not (Path(prefix) / 'drive_c').is_dir()):
             raise ValueError('The save prefix override must be an existing absolute Wine/Proton prefix containing drive_c.')
-        game['LudusaviBackup'] = {'automatic': editor.ludusavi_mode.currentData(), 'name': editor.ludusavi_name.text().strip(), 'prefix': prefix}
+        game['LudusaviBackup'] = {'automatic': editor.ludusavi_mode.currentData(), 'name': editor.ludusavi_name.text().strip(), 'prefix': prefix, 'progress_confirmed': editor.ludusavi_confirmed.isChecked()}
         if editor.ludusavi_has_definition or editor.ludusavi_files.toPlainText().strip() or editor.ludusavi_registry.toPlainText().strip():
             game['LudusaviBackup'].update(files=[p.strip() for p in editor.ludusavi_files.toPlainText().splitlines() if p.strip()],
                 registry=[p.strip() for p in editor.ludusavi_registry.toPlainText().splitlines() if p.strip()])

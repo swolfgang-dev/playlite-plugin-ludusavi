@@ -1,11 +1,11 @@
 {
   "id": "LudusaviBackup",
   "name": "Ludusavi Save Backup",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api_version": 1,
   "type": "generic",
   "enabled": true,
-  "minimum_playlite_version": "0.2.67",
+  "minimum_playlite_version": "0.2.68",
   "requirements": [
     "PyYAML>=6"
   ],

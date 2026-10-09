@@ -1,12 +1,14 @@
 # Ludusavi Save Backup for Playlite
 
-Requires Playlite 0.2.67+, Ludusavi 0.31+ and PyYAML. The default command uses the Ludusavi Flatpak (`com.github.mtkennerly.ludusavi`). Open Ludusavi and run Preview once before using the plugin. Configure your backup destination, retention, custom save paths and cloud account in Ludusavi.
+Requires Playlite 0.2.68+, Ludusavi 0.31+ and PyYAML. The default command uses the Ludusavi Flatpak (`com.github.mtkennerly.ludusavi`). Open Ludusavi and run Preview once before using the plugin. Configure your backup destination, retention, custom save paths and cloud account in Ludusavi.
 
 ## Use
 
 - **Settings → Plugins → Ludusavi Save Backup:** enable/disable automatic backups or cloud upload, optionally select a native executable and configuration folder. Opening settings does not change saved preferences.
 - **Edit → Installation:** edit save files/folders/patterns and registry rules, override the Ludusavi title or host Wine/Proton prefix, and enable/disable automatic backups per game.
 - **Game menu → Ludusavi Save Backup → Back up saves…:** back up just the selected game. With multiple host actions, choose the prefix to use.
+- **Inspect detected saves…:** show configured rules, a read-only preview of detected files, progress confirmation and the last recorded backup. Detection alone does not prove a file contains progress.
+- **Select multiple games → Ludusavi Save Backup → Edit selected save definitions…:** preview and change automatic backup settings, file rules or registry rules without changing individual titles or prefixes.
 - **Save backup status…:** view the latest result for the current Playlite session, retry a backup or open Ludusavi.
 - **Restore saves in Ludusavi…:** opens Ludusavi. Choose Restore Mode and review the destination before restoring. Playlite never restores automatically.
 - **Configure save locations in Ludusavi…:** opens that game’s Custom Games entry.
@@ -43,3 +45,5 @@ python3 playlite-plugin-ludusavi/tools/build_release.py
 The plugin is available locally; it has not been published to a remote repository or the plugin catalogue.
 
 Save backups run in a serial queue. When Ludusavi is already uploading from its own window or CLI, a queued backup waits for that transfer to finish before checking cloud conflicts and saving. Save backup status updates while waiting and uploading. Plugin uploads have no fixed three-minute cutoff; slow uploads complete before the next queued backup starts.
+
+Backup results persist across restarts. **Playlite menu → Background tasks…** shows queued backups, cloud uploads, definition syncs and save inspections alongside downloads. Retry actions are available for work created in the current session; previous sessions retain their logs. Details are expandable and can be copied.
