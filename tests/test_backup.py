@@ -12,7 +12,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('ludusavi_under_test', ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
 PACKAGE = importlib.util.module_from_spec(SPEC); sys.modules[SPEC.name] = PACKAGE; SPEC.loader.exec_module(PACKAGE)
-from ludusavi_under_test.backup import BackupEngine, resolve_context, cloud_busy
+from ludusavi_under_test.backup import BackupEngine, resolve_context, cloud_busy, emulator_save_paths, gse_save_paths
 from ludusavi_under_test.plugin import Plugin, BackupQueue
 
 APP = QApplication.instance() or QApplication([])
@@ -35,6 +35,41 @@ class BackupTests(unittest.TestCase):
         self.context = dict(prefix=str(self.prefix), directory=str(self.root / 'Games/Example'), name='Example', steam_id='42', exact_name=False)
         self.calls = []
         self.cloud_change = 'Same'; self.cloud_failure = False; self.no_files = False
+
+    def test_flatpak_access_is_read_only_for_scans_and_writable_for_restore_gui(self):
+        self.engine.command = ['flatpak', 'run', 'com.github.mtkennerly.ludusavi']
+        paths = [str(self.prefix), str(self.prefix)]
+        scan = self.engine.access_command(paths)
+        restore = self.engine.access_command(paths, writable=True)
+        self.assertEqual(scan[2], '--filesystem=' + str(self.prefix) + ':ro')
+        self.assertEqual(restore[2], '--filesystem=' + str(self.prefix) + ':rw')
+        self.assertEqual(len(scan), 4)
+        self.engine.command = ['/usr/bin/ludusavi']
+        self.assertEqual(self.engine.access_command(paths, writable=True), ['/usr/bin/ludusavi'])
+
+    def test_emulator_location_is_resolved_inside_prefix_and_rejects_escape(self):
+        folder = self.prefix / 'drive_c/Users/Public/Documents/Steam/CODEX/42'
+        folder.mkdir(parents=True)
+        install = self.root / 'game'; install.mkdir()
+        ini = install / 'steam_emu.ini'
+        ini.write_text('[Settings]\nAppId=42\nUserName=CODEX\n')
+        context = dict(self.context, directory=str(install))
+        self.assertEqual(emulator_save_paths(context), [str(folder)])
+        ini.write_text('[Settings]\nAppId=42\nUserName=../outside\n')
+        self.assertEqual(emulator_save_paths(context), [])
+        ini.write_text('[Settings]\nAppId=invalid\nUserName=CODEX\n')
+        self.assertEqual(emulator_save_paths(context), [])
+
+    def test_gse_saves_match_only_current_appid_and_cannot_escape_prefix(self):
+        root = self.prefix / 'drive_c/users/steamuser/AppData/Roaming/GSE Saves'
+        (root / '42').mkdir(parents=True)
+        (root / '99').mkdir()
+        self.assertEqual(gse_save_paths(self.context), [str(root / '42')])
+        self.assertEqual(gse_save_paths(dict(self.context, steam_id='../99')), [])
+        (root / '42').rmdir()
+        outside = self.root / 'outside'; outside.mkdir()
+        (root / '42').symlink_to(outside, target_is_directory=True)
+        self.assertEqual(gse_save_paths(self.context), [])
 
     def execute(self, args, config, timeout=180):
         self.calls.append(args)
@@ -150,6 +185,10 @@ class BackupTests(unittest.TestCase):
 
 
 class PluginUiTests(unittest.TestCase):
+    def setUp(self):
+        gui=patch("ludusavi_under_test.plugin.ludusavi_gui_open",return_value=False)
+        gui.start();self.addCleanup(gui.stop)
+
     def test_settings_cancel_and_save_are_separate(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = QSettings(str(Path(temporary) / 'settings.ini'), QSettings.Format.IniFormat)
@@ -186,7 +225,11 @@ class PluginUiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); prefix = root / 'prefix'; (prefix / 'drive_c').mkdir(parents=True)
             window = QMainWindow(); window.game_providers = []
+            window.game_detection = SimpleNamespace(status=lambda identity: 'Stopped')
+            window.game_status_changed = Mock()
             queue = BackupQueue(window); tasks = []
+            activity = []
+            window.game_status_changed.side_effect = lambda identity, status: activity.append((identity, queue.active[0]['Id'] if queue.active else None))
             action = {'Integration': 'LutrisIntegration', 'Prefix': str(prefix)}
             settings = {'state': str(root / 'state')}
             pool = SimpleNamespace(start=tasks.append)
@@ -203,4 +246,70 @@ class PluginUiTests(unittest.TestCase):
                 self.assertEqual(len(tasks), 2); self.assertEqual(queue.active[0]['Id'], 'b')
                 tasks[1].run()
                 self.assertIsNone(queue.active); self.assertEqual(set(queue.results), {'a', 'b'})
+                window.game_status_changed.assert_any_call('a', 'Stopped')
+                window.game_status_changed.assert_any_call('b', 'Stopped')
+                self.assertEqual(window.game_status_changed.call_args.args, ('b', 'Stopped'))
+                self.assertIn(('a', None), activity)
+                self.assertEqual(activity[-1], ('b', None))
+            window.close()
+
+class SeamlessQueueTests(unittest.TestCase):
+    def test_repeated_sync_requests_are_debounced_and_gui_defers_them(self):
+        window=QMainWindow();window.games=[]
+        plugin=Plugin();plugin.sync_definitions(window);plugin.sync_definitions(window)
+        self.assertTrue(plugin._sync_timer.isActive())
+        self.assertEqual(plugin._sync_timer.interval(),750)
+        with patch('ludusavi_under_test.plugin.ludusavi_gui_open',return_value=True):
+            plugin._dispatch_sync()
+        self.assertIsNotNone(plugin._sync_request)
+        self.assertEqual(plugin._sync_timer.interval(),3000)
+        plugin._sync_timer.stop();window.close()
+
+    def test_backup_stays_queued_while_ludusavi_gui_is_open(self):
+        window=QMainWindow();queue=BackupQueue(window)
+        with patch('ludusavi_under_test.plugin.ludusavi_gui_open',return_value=True):
+            queue.add({'Id':'one','Name':'Example'},{},{'state':'/tmp/playlite-test-unused'})
+        self.assertIsNone(queue.active)
+        self.assertEqual(len(queue.pending),1)
+        queue.wait_timer.stop();window.close()
+
+class StartupCacheTests(unittest.TestCase):
+    setUp=BackupTests.setUp
+    def test_persisted_fingerprint_skips_unchanged_startup(self):
+        from ludusavi_under_test.definitions import definition_fingerprint
+        window=QMainWindow();window.games=[{'Id':'one','Name':'Example'}]
+        plugin=Plugin();plugin.options=lambda:self.engine.settings
+        fingerprint=definition_fingerprint(window.games, self.engine.settings)
+        self.engine.state.mkdir();(self.engine.state/'definition-sync.fingerprint').write_text(fingerprint)
+        plugin.sync_definitions(window)
+        with patch('ludusavi_under_test.plugin.ludusavi_gui_open',return_value=False),patch('ludusavi_under_test.plugin.QThreadPool.globalInstance',return_value=SimpleNamespace(start=lambda task: task.run())),patch.object(plugin,'_sync_definitions_now') as sync:
+            plugin._dispatch_sync();sync.assert_not_called()
+            window.games[0]['LudusaviBackup']={'files':['/changed/save']}
+            plugin.sync_definitions(window);plugin._dispatch_sync();sync.assert_called_once()
+        plugin._sync_timer.stop();window.close()
+
+    def test_normal_ludusavi_config_rewrites_do_not_invalidate_definitions(self):
+        from ludusavi_under_test.definitions import definition_fingerprint
+        from unittest.mock import patch
+        import os
+        window = QMainWindow(); window.games = [{'Id': 'one', 'Name': 'Example'}]
+        try:
+            plugin = Plugin(); plugin.options = lambda: self.engine.settings
+            expected = definition_fingerprint(window.games, self.engine.settings)
+            self.engine.state.mkdir()
+            (self.engine.state / 'definition-sync.fingerprint').write_text(expected)
+            config = dict(self.original, backup={'path': '/changed/backups'}, view={'filter': 'Example'})
+            (self.config / 'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
+            manifest = self.config / 'manifest.yaml'
+            os.utime(manifest, ns=(manifest.stat().st_atime_ns, manifest.stat().st_mtime_ns + 1000000))
+            self.assertEqual(definition_fingerprint(window.games, self.engine.settings), expected)
+            with patch('ludusavi_under_test.plugin.ludusavi_gui_open', return_value=False), patch('ludusavi_under_test.plugin.QThreadPool.globalInstance', return_value=SimpleNamespace(start=lambda task: task.run())), patch.object(plugin, '_sync_definitions_now') as sync:
+                plugin.sync_definitions(window); plugin._dispatch_sync()
+                sync.assert_not_called()
+                config['customGames'] = [{'name': 'Example', 'files': ['/new/save']}]
+                (self.config / 'config.yaml').write_text(yaml.safe_dump(config))
+                plugin.sync_definitions(window); plugin._dispatch_sync()
+                sync.assert_called_once()
+            plugin._sync_timer.stop()
+        finally:
             window.close()

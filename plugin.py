@@ -6,12 +6,11 @@ import yaml
 from pathlib import Path
 import subprocess
 from PyQt6.QtCore import QObject, QSettings, QThreadPool, QTimer, pyqtSlot, pyqtSignal
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFormLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QWidget)
 from playlite.providers import GenericPlugin
 from playlite.lifecycle import run_dialog, show_warning
 from playlite.metadata_dialog import Task
-from .backup import BackupEngine, host_environment, resolve_context
+from .backup import BackupEngine, host_environment, resolve_context, ludusavi_gui_open
 
 
 class BackupQueue(QObject):
@@ -26,7 +25,15 @@ class BackupQueue(QObject):
         self.task_ids = {}
         self.states = {}
         self._task = None
+        self.wait_timer=QTimer(self);self.wait_timer.setSingleShot(True);self.wait_timer.timeout.connect(self.start_next)
+        self.upload_retries = {}
         self.progress.connect(self.update_progress)
+
+    def refresh_launch_activity(self, identity):
+        refresh = getattr(self.window, 'game_status_changed', None)
+        detection = getattr(self.window, 'game_detection', None)
+        if callable(refresh) and detection is not None:
+            refresh(identity, detection.status(identity))
 
     def add(self, game, action, settings):
         identity = game['Id']
@@ -43,9 +50,13 @@ class BackupQueue(QObject):
         if self.active:
             self.window.statusBar().showMessage('Save backup queued for ' + game['Name'], 8000)
         self.start_next()
+        self.refresh_launch_activity(identity)
 
     def start_next(self):
         if self.active or not self.pending:
+            return
+        if ludusavi_gui_open():
+            self.wait_timer.start(3000)
             return
         self.active = self.pending.pop(0)
         game, action, settings = self.active
@@ -60,12 +71,28 @@ class BackupQueue(QObject):
                 for provider in providers:
                     if callable(getattr(provider, 'detect_running', None)) and provider.owns(game) and game['Id'] in provider.detect_running([game]):
                         raise ValueError('Close the game before backing up its saves.')
+                from .definitions import sync_definitions
+                from playlite.library_storage import library_lock
+                with library_lock(self.window.data):
+                    latest = json.loads((self.window.data / 'library.json').read_text())
+                    current = next((g for g in latest if g['Id'] == game['Id']), None)
+                    if current is None:
+                        raise ValueError('This game was removed before its queued backup started.')
+                    sync_definitions([current], providers, settings)
                 context = resolve_context(game, action, providers)
                 return BackupEngine(settings).run(context, status=self.progress.emit)
         self._task = Task(work)
         self._task.signals.succeeded.connect(self.completed)
         self._task.signals.failed.connect(self.failed)
         QThreadPool.globalInstance().start(self._task)
+
+    def retry_upload(self, captured):
+        game, action, settings = captured
+        current = next((g for g in self.window.games if g['Id'] == game['Id']), None)
+        if current is None or self.window.game_detection.status(game['Id']) in ('Running','Launching'): return
+        mode=(current.get('LudusaviBackup') or {}).get('automatic','default')
+        if mode=='disabled' or not settings.get('cloud'): return
+        self.add(current, action, settings)
 
     @pyqtSlot(str)
     def update_progress(self, message):
@@ -78,6 +105,7 @@ class BackupQueue(QObject):
         registry = getattr(self.window, 'background_tasks', None)
         if registry is not None:
             registry.update(self.task_ids[game['Id']], state='Waiting' if message.startswith('Waiting') else 'Uploading' if message.startswith('Uploading') else 'Running', summary=message)
+        self.refresh_launch_activity(game['Id'])
 
     @pyqtSlot(object)
     def completed(self, result):
@@ -99,12 +127,22 @@ class BackupQueue(QObject):
         if registry is not None:
             registry.update(self.task_ids[game['Id']], state='Failed' if result['status'] == 'Backup failed' else 'Needs attention' if result.get('cloud') in ('Needs attention', 'Upload failed') else 'Complete',
                 summary=result['status'] + ' · Cloud: ' + result.get('cloud', 'Not attempted'), details=result.get('details', ''))
+        if result.get('cloud') == 'Upload failed':
+            attempt = self.upload_retries.get(game['Id'], 0)
+            if attempt < 3:
+                self.upload_retries[game['Id']] = attempt + 1
+                captured = copy.deepcopy(self.active)
+                retry_timer = QTimer(self); retry_timer.setSingleShot(True)
+                retry_timer.timeout.connect(lambda captured=captured, timer=retry_timer: (self.retry_upload(captured), timer.deleteLater()))
+                retry_timer.start(60000 * (attempt + 1))
+        elif result.get('cloud') == 'Uploaded': self.upload_retries.pop(game['Id'], None)
         message = f"{game['Name']}: {result['status']}"
         if result.get('cloud') not in ('Uploaded', 'Disabled', 'Not attempted'):
             message += ' — cloud needs attention (see Save backup status)'
         self.window.statusBar().showMessage(message, 15000)
         self.active = None
         self._task = None
+        self.refresh_launch_activity(game['Id'])
         self.start_next()
 
     @pyqtSlot(str)
@@ -123,7 +161,7 @@ class Plugin(GenericPlugin):
         settings = self.settings()
         env = host_environment()
         state = Path(env.get('XDG_STATE_HOME', str(Path(env['HOME']) / '.local/state'))) / 'playlite/ludusavi'
-        return {'automatic': settings.value('automatic', True, type=bool),
+        return {'persistent_access': True, 'automatic': settings.value('automatic', True, type=bool),
                 'cloud': settings.value('cloud', True, type=bool),
                 'native': settings.value('native', '', type=str),
                 'config': settings.value('config', '', type=str), 'state': str(state)}
@@ -151,15 +189,36 @@ class Plugin(GenericPlugin):
             return
         self.controller(window).add(launch_game, launch_action, options)
 
+    action_group = 'Saves'
+
     def game_actions(self, window, game):
-        from .inspection import show_inspection
-        return [('Inspect detected saves…', lambda: show_inspection(self, window, game)),
-                ('Edit save definition…', lambda: self.edit_definition(window, game)),
-                ('Sync save definition from manifest…', lambda: self.sync_definitions(window, [game])),
-                ('Back up saves…', lambda: self.backup(window, game)),
-                ('Restore saves in Ludusavi…', lambda: self.open_ludusavi(window, game)),
-                ('Configure save locations in Ludusavi…', lambda: self.open_ludusavi(window, game, custom=True)),
-                ('Save backup status…', lambda: self.show_status(window, game))]
+        from .manager import show_manager
+        return [('Back up now', lambda: self.backup(window, game)),
+                ('Restore…', lambda: show_manager(self, window, game, restore=True)),
+                ('Manage saves…', lambda: show_manager(self, window, game))]
+
+    def launch_activity(self, window, game):
+        controller=self.controller(window)
+        if controller.active and controller.active[0]['Id']==game['Id']:
+            result=controller.results.get(game['Id'],{})
+            return 'Uploading saves' if result.get('cloud')=='In progress' and result.get('status','').startswith('Uploading') else 'Backing up saves'
+        if any(g['Id']==game['Id'] for g,_,_ in controller.pending): return 'Save backup queued'
+        return ''
+
+    def readiness_checks(self, window, game):
+        from playlite.play_actions import actions_for
+        actions = [a for a in actions_for(game, window.game_providers) if a.get('Integration') in ('SteamIntegration','LutrisIntegration') and not a.get('IsVM')]
+        if not actions: return {'issues': [], 'checked': ['Save backup is not configured for this launch type.']}
+        issues=[]; checked=[]
+        for action in actions:
+            try:
+                resolve_context(game,action,window.game_providers)
+                from .definitions import read_definition
+                definition=read_definition(game,self.options())
+                if definition: checked.append('Save definition and host prefix are available.')
+                else: issues.append('Save definition needs synchronization; open Manage saves.')
+            except (OSError,ValueError) as error: issues.append('Save backup: '+str(error))
+        return {'issues':list(dict.fromkeys(issues)), 'checked':list(dict.fromkeys(checked))}
 
     def batch_game_actions(self, window, games):
         from .bulk_definitions import edit_definitions
@@ -170,15 +229,60 @@ class Plugin(GenericPlugin):
         window = parent
         while window is not None and not hasattr(window, 'games'):
             window = window.parent()
+        if window is None: return
+        self._sync_request = (window, settings)
+        if not hasattr(self, '_sync_timer'):
+            self._sync_timer = QTimer(window); self._sync_timer.setSingleShot(True)
+            self._sync_timer.timeout.connect(self._dispatch_sync)
+        self._sync_timer.start(750)
+
+    def _dispatch_sync(self):
+        request = getattr(self, '_sync_request', None)
+        if not request: return
+        if getattr(self, '_sync_busy', False):
+            self._sync_timer.start(1000); return
+        if ludusavi_gui_open():
+            self._sync_timer.start(3000); return
+        if getattr(self, '_sync_check_task', None) is not None:
+            self._sync_timer.start(1000); return
+        window, options = request
+        options = options or self.options()
+        games = copy.deepcopy(window.games)
+        from .definitions import definition_fingerprint
+        task = Task(lambda: definition_fingerprint(games, options))
+        self._sync_check_task = task
+        def checked(fingerprint):
+            self._sync_check_task = None
+            if self._sync_request is not request:
+                self._sync_timer.start(750); return
+            engine = BackupEngine(options)
+            cached = getattr(self, '_sync_fingerprint', None)
+            if cached is None:
+                try: cached = (engine.state / 'definition-sync.fingerprint').read_text().strip()
+                except OSError: pass
+            self._sync_request = None
+            if fingerprint and fingerprint == cached:
+                return
+            self._sync_busy = True
+            self._sync_definitions_now(window, settings=options)
+        task.signals.succeeded.connect(checked)
+        task.signals.failed.connect(lambda _: checked(None))
+        QThreadPool.globalInstance().start(task)
+
+    def _sync_definitions_now(self, parent, games=None, settings=None):
+        window = parent
+        while window is not None and not hasattr(window, 'games'):
+            window = window.parent()
         if window is None:
             show_warning(parent, 'Save definitions', 'Open these settings from the game library.')
             return
         options = settings or self.options()
         games = copy.deepcopy(window.games if games is None else games)
         providers = list(window.game_providers)
+        completed_fingerprint = {}
         def work():
             import fcntl
-            from .definitions import sync_definitions
+            from .definitions import sync_definitions, definition_fingerprint
             state = Path(options['state']); state.mkdir(parents=True, exist_ok=True)
             with (state / 'backup.lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
@@ -192,7 +296,12 @@ class Plugin(GenericPlugin):
                                 raise ValueError('Close the Ludusavi window before syncing save definitions, then retry.')
                     except OSError:
                         continue
-                return sync_definitions(games, providers, options)
+                from playlite.library_storage import library_lock
+                with library_lock(window.data):
+                    current = json.loads((window.data / 'library.json').read_text())
+                    result = sync_definitions(current, providers, options, reconcile=True)
+                    completed_fingerprint['value'] = definition_fingerprint(current, options)
+                    return result
         registry = getattr(window, 'background_tasks', None)
         identity = registry.update(title='Sync save definitions', kind='Save definitions', state='Running',
             summary=f'Scanning {len(games)} games…', retry=lambda: self.sync_definitions(window, games, options)) if registry is not None else None
@@ -202,20 +311,46 @@ class Plugin(GenericPlugin):
             task.signals.failed.connect(lambda error: registry.update(identity, state='Failed', summary='Save definition sync failed.', details=error))
         task.signals.succeeded.connect(lambda result: window.statusBar().showMessage(
             f"Save definitions synced: {len(result['updated'])}; skipped: {len(result['skipped'])}", 15000))
-        task.signals.failed.connect(lambda error: show_warning(window, 'Save definitions', error))
+        task.signals.failed.connect(lambda error: window.statusBar().showMessage('Save definition update deferred: ' + error, 10000))
         # Retain tasks until their queued Qt callbacks finish.
         tasks = getattr(window, '_ludusavi_definition_tasks', None)
         if tasks is None:
             tasks = window._ludusavi_definition_tasks = []
         tasks.append(task)
+        def finish_sync(*_):
+            self._sync_busy = False
+            if self._sync_request: self._sync_timer.start(750)
+        def remember_sync(_):
+            if self._sync_request:return
+            self._sync_fingerprint = completed_fingerprint.get('value')
+            if not self._sync_fingerprint: return
+            engine = BackupEngine(options)
+            engine.state.mkdir(parents=True,exist_ok=True)
+            (engine.state/'definition-sync.fingerprint').write_text(self._sync_fingerprint)
+        task.signals.succeeded.connect(remember_sync)
+        task.signals.succeeded.connect(finish_sync); task.signals.failed.connect(finish_sync)
         task.signals.succeeded.connect(lambda result: tasks.remove(task))
         task.signals.failed.connect(lambda error: tasks.remove(task))
         window.statusBar().showMessage('Syncing Ludusavi custom save definitions…')
         QThreadPool.globalInstance().start(task)
 
+    def library_ready(self, window):
+        engine = BackupEngine(self.options())
+        if (engine.config / 'config.yaml').is_file() and (engine.config / 'manifest.yaml').is_file():
+            self.sync_definitions(window)
+
     def after_game_updated(self, window, game):
-        if 'files' in (game.get('LudusaviBackup') or {}):
-            self.sync_definitions(window, [game])
+        record=Path(self.options()['state'])/'detection-results.json'
+        try:
+            data=json.loads(record.read_text());data.pop(game['Id'],None);record.write_text(json.dumps(data,indent=2))
+        except (OSError,ValueError):pass
+        self.sync_definitions(window)
+
+    def after_game_added(self, window, game, editor):
+        self.sync_definitions(window)
+
+    def after_game_removed(self, window, game):
+        self.sync_definitions(window)
 
     def edit_definition(self, window, game):
         from playlite.editor import MetadataEditor
@@ -272,51 +407,27 @@ class Plugin(GenericPlugin):
                 raise ValueError('Close the game before opening restore/configuration.')
             options = self.options()
             engine = BackupEngine(options)
-            command = list(engine.command)
+            from playlite.play_actions import actions_for
+            contexts = [resolve_context(game, action, window.game_providers)
+                        for action in actions_for(game, window.game_providers)
+                        if action.get('Integration') in ('SteamIntegration', 'LutrisIntegration') and not action.get('IsVM')]
+            if not contexts and (game.get('LudusaviBackup') or {}).get('prefix'):
+                contexts = [resolve_context(game, None, window.game_providers)]
+            from .definitions import register_detected_locations
+            title = register_detected_locations(game, contexts, options)
+            paths = [path for context in contexts for path in (context['prefix'], context['directory']) if path]
+            configuration = yaml.safe_load((engine.config / 'config.yaml').read_text()) or {}
+            paths += [p for entry in configuration.get('customGames', []) for p in entry.get('winePrefix', [])]
+            command = engine.access_command(paths, writable=True)
             if options['config']:
                 command += ['--config', options['config']]
             command += ['gui']
             if custom:
-                command += ['--custom-game', (game.get('LudusaviBackup') or {}).get('name') or game['Name']]
+                command += ['--custom-game', title]
             subprocess.Popen(command, env=engine.env, start_new_session=True)
             window.statusBar().showMessage('In Ludusavi, choose Restore Mode and review the save paths before restoring.', 15000)
         except (OSError, ValueError) as error:
             show_warning(window, 'Ludusavi', str(error))
-
-    def show_status(self, window, game):
-        controller = self.controller(window)
-        dialog = QDialog(window); dialog.setWindowTitle('Save backup — ' + game['Name']); dialog.resize(650, 420)
-        layout = QVBoxLayout(dialog)
-        summary = QLabel(); layout.addWidget(summary)
-        details = QPlainTextEdit(); details.setReadOnly(True); details.hide()
-        toggle = QPushButton('Show details'); toggle.setCheckable(True); toggle.toggled.connect(details.setVisible)
-        toggle.toggled.connect(lambda on: toggle.setText('Hide details' if on else 'Show details'))
-        layout.addWidget(toggle)
-        from PyQt6.QtWidgets import QApplication
-        copy_button = QPushButton('Copy log'); copy_button.clicked.connect(lambda: QApplication.clipboard().setText(summary.text() + '\n\n' + details.toPlainText()))
-        layout.addWidget(copy_button); layout.addWidget(details)
-        retry = QPushButton('Retry backup'); retry.clicked.connect(lambda: (dialog.accept(), self.backup(window, game)))
-        layout.addWidget(retry)
-        open_button = QPushButton('Open Ludusavi'); open_button.clicked.connect(lambda: (dialog.accept(), self.open_ludusavi(window, game)))
-        layout.addWidget(open_button)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
-        def refresh():
-            result = controller.results.get(game['Id'])
-            if result is None:
-                try:
-                    result = json.loads((Path(self.options()['state']) / 'backup-results.json').read_text()).get(game['Id'])
-                except (OSError, ValueError):
-                    pass
-            result = result or {'status': 'No backup recorded'}
-            summary.setText(result['status'] + '\nCloud: ' + result.get('cloud', 'Not attempted'))
-            text = result.get('details', '')
-            if details.toPlainText() != text:
-                details.setPlainText(text)
-            queued = (controller.active and controller.active[0]['Id'] == game['Id']) or any(job[0]['Id'] == game['Id'] for job in controller.pending)
-            retry.setEnabled(not queued)
-        refresh()
-        timer = QTimer(dialog); timer.setInterval(500); timer.timeout.connect(refresh); timer.start()
-        run_dialog(dialog)
 
     def create_settings(self, parent=None):
         widget = QWidget(parent); form = QFormLayout(widget); options = self.options()

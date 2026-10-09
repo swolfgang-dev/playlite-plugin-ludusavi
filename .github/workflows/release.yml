@@ -1,0 +1,44 @@
+name: Test and release plugin
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      XDG_DATA_HOME: ${{ github.workspace }}/test-data
+      XDG_CONFIG_HOME: ${{ github.workspace }}/test-config
+      XDG_STATE_HOME: ${{ github.workspace }}/test-state
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: swolfgang-dev/Playlite
+          path: core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon0
+          python -m pip install ./core PyYAML
+      - name: Run plugin tests
+        working-directory: plugin
+        run: python -m unittest discover -s tests -q
+      - name: Build standalone release
+        working-directory: plugin
+        run: python tools/build_release.py
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: plugin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

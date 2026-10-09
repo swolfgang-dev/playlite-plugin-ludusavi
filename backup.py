@@ -1,5 +1,6 @@
 """Ludusavi CLI integration with isolated host roots and conservative cloud sync."""
 import copy
+import configparser
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,16 @@ import time
 import yaml
 
 APP_ID = 'com.github.mtkennerly.ludusavi'
+
+
+def ludusavi_gui_open():
+    for path in Path('/proc').iterdir():
+        try:
+            if path.name.isdecimal() and path.stat().st_uid == os.getuid() and (path/'comm').read_text().strip().lower()=='ludusavi':
+                if b'--api' not in (path/'cmdline').read_bytes().split(b'\0'):
+                    return True
+        except OSError:pass
+    return False
 
 
 def cloud_busy(proc=Path('/proc')):
@@ -109,6 +120,55 @@ def resolve_context(game, action, providers):
             **{key: override[key] for key in ('files', 'registry') if key in override}}
 
 
+def emulator_save_paths(context):
+    """Derive save locations from emulator settings without editing the config."""
+    directory = context.get('directory')
+    if not directory:
+        return []
+    source = Path(directory) / 'steam_emu.ini'
+    try:
+        text = source.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return []
+    ini = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        ini.read_string(text)
+        appid = ini.get('Settings', 'AppId').strip()
+        username = ini.get('Settings', 'UserName').strip()
+    except (configparser.Error, KeyError):
+        return []
+    if not appid.isdecimal() or not username or username in ('.', '..') or any(c in username for c in '/\\:%'):
+        return []
+    drive = (Path(context['prefix']) / 'drive_c').resolve()
+    path = drive
+    for part in ('Users', 'Public', 'Documents', 'Steam', username, appid):
+        candidate = path / part
+        if not candidate.exists() and path.is_dir():
+            matches = [child for child in path.iterdir() if child.name.casefold() == part.casefold()]
+            if len(matches) == 1:
+                candidate = matches[0]
+        path = candidate
+    path = path.resolve()
+    return [str(path)] if path.is_relative_to(drive) and path.is_dir() and not vm_path(path) else []
+
+
+def gse_save_paths(context):
+    """Find existing emulator saves for this Steam ID in the selected host prefix."""
+    appid = str(context.get('steam_id') or '')
+    if not appid.isdecimal():
+        return []
+    drive = (Path(context['prefix']) / 'drive_c').resolve()
+    users = drive / 'users'
+    if not users.is_dir():
+        return []
+    paths = []
+    for user in users.iterdir():
+        path = (user / 'AppData/Roaming/GSE Saves' / appid).resolve()
+        if path.is_relative_to(drive) and path.is_dir() and not vm_path(path):
+            paths.append(str(path))
+    return list(dict.fromkeys(paths))
+
+
 class BackupEngine:
     def __init__(self, settings):
         self.settings = settings
@@ -119,10 +179,32 @@ class BackupEngine:
         self.config = Path(settings.get('config') or (home / '.config/ludusavi' if native else
             home / '.var/app' / APP_ID / 'config/ludusavi'))
         self.state = Path(settings['state'])
+        self.read_paths = []
+
+    def grant_persistent_access(self, paths):
+        if self.command[:2] != ['flatpak', 'run'] or not self.settings.get('persistent_access'):
+            return
+        home = Path(self.env['HOME']).resolve()
+        grants = list(dict.fromkeys(str(Path(p).resolve()) for p in paths if p and
+                                   not Path(p).resolve().is_relative_to(home) and not vm_path(p)))
+        if not grants: return
+        completed = subprocess.run(['flatpak', 'override', '--user'] +
+            ['--filesystem=' + p + ':rw' for p in grants] + [APP_ID],
+            env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        if completed.returncode:
+            raise ValueError('Could not grant Ludusavi access to the game folders: ' + completed.stderr.strip())
+
+    def access_command(self, paths=(), writable=False):
+        if self.command[:2] != ['flatpak', 'run']:
+            return list(self.command)
+        access = ':rw' if writable else ':ro'
+        grants = list(dict.fromkeys(str(Path(path).resolve()) for path in paths if path))
+        return self.command[:2] + ['--filesystem=' + path + access for path in grants] + self.command[2:]
 
     def execute(self, args, config, timeout=180):
         try:
-            completed = subprocess.run(self.command + ['--config', str(config), '--no-manifest-update'] + args,
+            command = self.access_command(self.read_paths)
+            completed = subprocess.run(command + ['--config', str(config), '--no-manifest-update'] + args,
                 env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             raise ValueError('Ludusavi timed out. Retry later or check the cloud status in Ludusavi.') from error
@@ -148,6 +230,8 @@ class BackupEngine:
     def run(self, context, preview=False, status=lambda message: None):
         if not (self.config / 'config.yaml').is_file() or not (self.config / 'manifest.yaml').is_file():
             raise ValueError('Open Ludusavi and run Preview once to create its configuration and game manifest.')
+        self.read_paths = list(dict.fromkeys(str(Path(path).resolve()) for path in
+            (context['prefix'], context['directory']) if path))
         config = yaml.safe_load((self.config / 'config.yaml').read_text()) or {}
         config = copy.deepcopy(config)
         # Never scan VM drives or other configured launcher libraries for this job.
@@ -178,6 +262,15 @@ class BackupEngine:
             if len(matches) != 1:
                 raise ValueError('No unique Ludusavi match. Set the Ludusavi title in Edit → Installation or create a Custom Game in Ludusavi.')
             name = matches[0]
+            inferred = emulator_save_paths(context) + gse_save_paths(context)
+            if inferred:
+                entries = config.setdefault('customGames', [])
+                entry = next((e for e in entries if e['name'] == name), None)
+                if entry is None:
+                    entry = {'name': name, 'integration': 'extend', 'files': []}
+                    entries.append(entry)
+                entry['files'] = list(dict.fromkeys(entry.get('files', []) + inferred))
+                (isolated / 'config.yaml').write_text(yaml.safe_dump(config))
             sync = bool(self.settings.get('cloud', True) and (config.get('cloud') or {}).get('synchronize') and (config.get('cloud') or {}).get('remote'))
             before, cloud_problem = None, None
             if sync and not preview:
