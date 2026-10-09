@@ -1,0 +1,13 @@
+{
+  "id": "LudusaviBackup",
+  "name": "Ludusavi Save Backup",
+  "version": "0.2.0",
+  "api_version": 1,
+  "type": "generic",
+  "enabled": true,
+  "minimum_playlite_version": "0.2.67",
+  "requirements": [
+    "PyYAML>=6"
+  ],
+  "description": "Back up host game saves through Ludusavi on game exit, with manual backup and restore access."
+}
