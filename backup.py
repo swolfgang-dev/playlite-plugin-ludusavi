@@ -9,7 +9,10 @@ import shutil
 import subprocess
 import tempfile
 import time
+from time import sleep
 import yaml
+
+_MATCHES = {}
 
 APP_ID = 'com.github.mtkennerly.ludusavi'
 
@@ -223,16 +226,17 @@ class BackupEngine:
             if not waiting:
                 status('Waiting for the current Ludusavi upload to finish…')
                 waiting = True
-            time.sleep(1)
+            sleep(1)
         if waiting:
             status('Backing up saves…')
 
-    def run(self, context, preview=False, status=lambda message: None):
+    def run(self, context, preview=False, status=lambda message: None, defer_cloud=False):
         if not (self.config / 'config.yaml').is_file() or not (self.config / 'manifest.yaml').is_file():
             raise ValueError('Open Ludusavi and run Preview once to create its configuration and game manifest.')
         self.read_paths = list(dict.fromkeys(str(Path(path).resolve()) for path in
             (context['prefix'], context['directory']) if path))
-        config = yaml.safe_load((self.config / 'config.yaml').read_text()) or {}
+        preparation_started = time.monotonic()
+        config = yaml.load((self.config / 'config.yaml').read_bytes(), Loader=yaml.CSafeLoader) or {}
         config = copy.deepcopy(config)
         # Never scan VM drives or other configured launcher libraries for this job.
         config['roots'] = [{'store': 'otherWine', 'path': context['prefix']}]
@@ -257,7 +261,16 @@ class BackupEngine:
                 args += ['--steam-id', str(context['steam_id'])]
             if not context['exact_name']:
                 args += ['--normalized']
-            found = self.execute(args + ['--', context['name']], isolated)
+            manifest_stat = (self.config / 'manifest.yaml').stat()
+            match_key = (tuple(self.command), str(self.config), manifest_stat.st_mtime_ns, manifest_stat.st_ctime_ns,
+                         json.dumps(config.get('customGames'), sort_keys=True), tuple(args), context['name'])
+            found = _MATCHES.get(match_key)
+            if found is None:
+                status('Matching save definition…')
+                found = self.execute(args + ['--', context['name']], isolated)
+                if len(found.get('games', {})) == 1:
+                    if len(_MATCHES) >= 64: _MATCHES.clear()
+                    _MATCHES[match_key] = found
             matches = list(found.get('games', {}))
             if len(matches) != 1:
                 raise ValueError('No unique Ludusavi match. Set the Ludusavi title in Edit → Installation or create a Custom Game in Ludusavi.')
@@ -272,16 +285,17 @@ class BackupEngine:
                 entry['files'] = list(dict.fromkeys(entry.get('files', []) + inferred))
                 (isolated / 'config.yaml').write_text(yaml.safe_dump(config))
             sync = bool(self.settings.get('cloud', True) and (config.get('cloud') or {}).get('synchronize') and (config.get('cloud') or {}).get('remote'))
-            before, cloud_problem = None, None
+            cloud_root, cloud_problem = None, None
             if sync and not preview:
-                self.wait_for_cloud(status)
-                # Verify the previous backup matches the cloud before making local changes.
+                from .cloud_jobs import baseline
                 try:
-                    before = self.execute(['cloud', 'upload', '--preview', '--api', '--', name], isolated, timeout=60)
-                    if any(item['change'] not in ('New', 'Same') for item in before.get('cloud', {}).values()):
-                        cloud_problem = 'Cloud conflict: open Ludusavi to choose which copy to keep.'
-                except ValueError as error:
+                    status('Preserving cloud comparison snapshot…')
+                    cloud_root = baseline(self, config, name)
+                except (OSError, subprocess.SubprocessError, yaml.YAMLError) as error:
                     cloud_problem = str(error)
+            status('Scanning save files…')
+            preparation_seconds = time.monotonic() - preparation_started
+            started = time.monotonic()
             local_args = ['backup', '--api', '--force', '--no-cloud-sync', '--wine-prefix', context['prefix']]
             scan = self.execute(local_args + ['--preview', '--', name], isolated)
             files = [path for result in scan.get('games', {}).values() for path in result.get('files', {})]
@@ -291,18 +305,29 @@ class BackupEngine:
                 return {'name': name, 'status': 'No saves found', 'local_saved': False, 'cloud': 'Not attempted', 'details': 'Check the Ludusavi title, prefix, and custom save locations.'}
             if preview:
                 return {'name': name, 'status': 'Preview', 'files': files, 'local_saved': False, 'cloud': 'Not attempted'}
+            scan_seconds = time.monotonic() - started
+            status('Saving local backup…')
+            started = time.monotonic()
             result = self.execute(local_args + ['--', name], isolated, timeout=1200)
+            local_seconds = time.monotonic() - started
+            status('Local backup saved.')
             saved = {'name': name, 'status': 'Local backup saved', 'local_saved': True,
                      'cloud': 'Disabled', 'details': json.dumps(result, indent=2)}
-            if sync:
-                if cloud_problem:
-                    saved.update(cloud='Needs attention', details=cloud_problem)
-                else:
-                    try:
-                        self.wait_for_cloud(status)
-                        status('Uploading save backup…')
-                        self.execute(['cloud', 'upload', '--force', '--api', '--', name], isolated, timeout=None)
-                        saved.update(status='Backup complete', cloud='Uploaded')
-                    except ValueError as error:
-                        saved.update(cloud='Upload failed', details=str(error))
+            saved['timings'] = {'preparation_seconds': round(preparation_seconds, 3), 'scan_seconds': round(scan_seconds, 3), 'local_seconds': round(local_seconds, 3)}
+            if cloud_problem:
+                saved.update(cloud='Needs attention', details=saved['details'] + '\nCould not preserve cloud baseline: ' + cloud_problem)
+            elif sync:
+                from .cloud_jobs import prepare, upload
+                try:
+                    job = prepare(self, config, name, cloud_root, game_id=context.get('game_id'))
+                    saved.update(cloud='Queued', cloud_job=job)
+                    if not defer_cloud:
+                        started = time.monotonic()
+                        outcome = upload(self, job, status)
+                        saved['cloud'] = outcome['cloud']
+                        saved['details'] += '\nCloud: ' + outcome.get('details', '')
+                        if outcome['cloud'] in ('Uploaded', 'Up to date'): saved.pop('cloud_job', None)
+                        saved['timings']['cloud_seconds'] = round(time.monotonic() - started, 3)
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    saved.update(cloud='Upload failed', details=str(error))
             return saved

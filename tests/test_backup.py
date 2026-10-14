@@ -83,6 +83,10 @@ class BackupTests(unittest.TestCase):
             if '--preview' in args: return {'cloud': {'save': {'change': self.cloud_change}}}
             if self.cloud_failure: raise ValueError('Cloud unavailable')
             return {}
+        if args[0] == 'backup' and '--preview' not in args and not self.no_files:
+            folder = Path(snapshot['backup']['path']) / 'Example'; folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'mapping.yaml').write_text(yaml.safe_dump({'name': 'Example'}))
+            (folder / 'save.dat').write_text('game progress')
         files = {} if self.no_files else {str(self.prefix / 'drive_c/save.dat'): {'bytes': 10}}
         return {'games': {'Example': {'decision': 'Processed', 'files': files}}}
 
@@ -101,14 +105,15 @@ class BackupTests(unittest.TestCase):
         self.assertTrue(all(args[-2:] == ['--', 'Example'] for args in self.calls))
         self.assertIn('--no-cloud-sync', self.calls[local])
 
-    def test_cloud_commands_wait_for_external_upload_before_backup(self):
+    def test_cloud_wait_never_delays_local_backup(self):
         updates = []
         def status(message):
             updates.append(message)
             if message.startswith('Waiting'):
-                self.assertFalse(any(args[0] in ('cloud', 'backup') for args in self.calls))
+                self.assertTrue(any(args[0] == 'backup' and '--preview' not in args for args in self.calls))
+                self.assertFalse(any(args[0] == 'cloud' for args in self.calls))
         with patch('ludusavi_under_test.backup.cloud_busy', side_effect=[True, True, False, False]), \
-             patch('ludusavi_under_test.backup.time.sleep') as sleep, \
+             patch('ludusavi_under_test.backup.sleep') as sleep, \
              patch.object(self.engine, 'execute', side_effect=self.execute) as execute:
             result = self.engine.run(self.context, status=status)
         self.assertEqual(result['cloud'], 'Uploaded')
@@ -140,6 +145,41 @@ class BackupTests(unittest.TestCase):
     def test_cloud_failure_does_not_fail_local_backup(self):
         self.cloud_failure = True; result = self.run_engine()
         self.assertTrue(result['local_saved']); self.assertEqual(result['cloud'], 'Upload failed')
+
+    def test_match_is_reused_until_manifest_or_definition_changes(self):
+        with patch.object(self.engine, 'execute', side_effect=self.execute):
+            self.engine.run(self.context, preview=True)
+            self.engine.run(self.context, preview=True)
+            self.assertEqual(sum(args[0] == 'find' for args in self.calls), 1)
+            (self.config / 'manifest.yaml').write_text('{Changed: {}}')
+            self.engine.run(self.context, preview=True)
+            self.assertEqual(sum(args[0] == 'find' for args in self.calls), 2)
+
+    def test_launch_only_edits_do_not_invalidate_save_definitions(self):
+        from ludusavi_under_test.definitions import definition_fingerprint
+        game = {'Id': 'one', 'Name': 'Example', 'PlayActions': [{'Integration': 'LutrisIntegration', 'Prefix': str(self.prefix), 'Name': 'Play', 'Arguments': ''}]}
+        fingerprint = definition_fingerprint([game], self.engine.settings)
+        game['PlayActions'][0].update(Name='Modded', Arguments='--mod', Executable='/new/game.exe')
+        game['LudusaviBackup'] = {'automatic': 'disabled', 'progress_confirmed': True}
+        self.assertEqual(definition_fingerprint([game], self.engine.settings), fingerprint)
+        game['PlayActions'][0]['Prefix'] = '/different/prefix'
+        self.assertNotEqual(definition_fingerprint([game], self.engine.settings), fingerprint)
+
+    def test_deferred_cloud_returns_local_success_without_cloud_commands(self):
+        with patch.object(self.engine, 'execute', side_effect=self.execute):
+            result = self.engine.run(self.context, defer_cloud=True)
+        self.assertTrue(result['local_saved'])
+        self.assertEqual(result['cloud'], 'Queued')
+        self.assertTrue(Path(result['cloud_job']).is_dir())
+        self.assertFalse(any(args[0] == 'cloud' for args in self.calls))
+        self.assertIn('local_seconds', result['timings'])
+
+    def test_baseline_failure_does_not_prevent_local_backup(self):
+        with patch('ludusavi_under_test.cloud_jobs.baseline', side_effect=OSError('No space')), patch.object(self.engine, 'execute', side_effect=self.execute):
+            result = self.engine.run(self.context, defer_cloud=True)
+        self.assertTrue(result['local_saved'])
+        self.assertEqual(result['cloud'], 'Needs attention')
+        self.assertFalse(any(args[0] == 'cloud' for args in self.calls))
 
     def test_preview_never_writes_backups_or_contacts_cloud(self):
         result = self.run_engine(preview=True)
@@ -241,7 +281,7 @@ class PluginUiTests(unittest.TestCase):
                 self.assertEqual(len(tasks), 1); self.assertEqual(len(queue.pending), 1)
                 self.assertEqual(queue.results['b']['status'], 'Backup queued')
                 queue.update_progress('Waiting for the current Ludusavi upload to finish…')
-                self.assertEqual(queue.results['a']['cloud'], 'Waiting')
+                self.assertEqual(queue.results['a']['cloud'], 'Not attempted')
                 tasks[0].run()
                 self.assertEqual(len(tasks), 2); self.assertEqual(queue.active[0]['Id'], 'b')
                 tasks[1].run()

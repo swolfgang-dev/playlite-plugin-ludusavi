@@ -1,5 +1,5 @@
 import json
-import test_backup
+import test_backup  # noqa: F401 — initializes the plugin package and Qt application
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest

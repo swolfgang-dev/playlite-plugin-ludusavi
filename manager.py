@@ -120,6 +120,7 @@ def show_manager(plugin, window, game, restore=False):
             except OSError: size = 'Unavailable'
             item = QTreeWidgetItem([p, size]); item.setToolTip(0,p); matches.addTopLevelItem(item)
         summary = f'{len(files)} files detected' if files else 'No saves found yet'
+        state['summary'] = summary
         status.setText(summary + '\n' + status_text())
         record=Path(options['state'])/'detection-results.json'
         try: records=json.loads(record.read_text()) if record.exists() else {}
@@ -136,7 +137,11 @@ def show_manager(plugin, window, game, restore=False):
         confirm.setEnabled(bool(files)); consent.setChecked(False)
     def status_text():
         r = save_status(plugin,window,game)
-        return 'Backup: ' + r.get('status','No backup recorded') + (' · ' + backup_age(r['updated']) if r.get('updated') else '') + '\nCloud: ' + r.get('cloud','Not attempted')
+        cloud = r.get('details') if r.get('cloud') in ('In progress', 'Waiting') else r.get('cloud', 'Not attempted')
+        timing = r.get('timings', {})
+        times = ' · '.join(label + ': ' + str(timing[key]) + 's' for key, label in
+                           [('scan_seconds', 'Scan'), ('local_seconds', 'Local'), ('cloud_seconds', 'Cloud')] if key in timing)
+        return 'Backup: ' + r.get('status','No backup recorded') + (' · ' + backup_age(r['updated']) if r.get('updated') else '') + '\nCloud: ' + str(cloud) + ('\n' + times if times else '')
     def persist(patch):
         try:
             window.games = apply_overrides(window.data, {game['Id']:patch}); captured.setdefault('LudusaviBackup',{}).update(patch)
@@ -188,6 +193,11 @@ def show_manager(plugin, window, game, restore=False):
     apply.clicked.connect(do_restore)
     timer=QTimer(dialog);timer.setInterval(100)
     def poll():
+        text = status_text()
+        if text != state.get('backup_status'):
+            state['backup_status'] = text
+            if not state['busy'] and state.get('summary'):
+                status.setText(state['summary'] + '\n' + text)
         if not results:return
         value=dict(results);results.clear();state['busy']=False
         for button in (refresh,save,backup,external,preview_button,confirm):button.setEnabled(True)

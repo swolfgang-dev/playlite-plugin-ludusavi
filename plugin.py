@@ -5,6 +5,7 @@ import os
 import yaml
 from pathlib import Path
 import subprocess
+import time
 from PyQt6.QtCore import QObject, QSettings, QThreadPool, QTimer, pyqtSlot, pyqtSignal
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QWidget)
 from playlite.providers import GenericPlugin
@@ -26,7 +27,8 @@ class BackupQueue(QObject):
         self.states = {}
         self._task = None
         self.wait_timer=QTimer(self);self.wait_timer.setSingleShot(True);self.wait_timer.timeout.connect(self.start_next)
-        self.upload_retries = {}
+        from .cloud_queue import CloudQueue
+        self.cloud_queue = CloudQueue(self)
         self.progress.connect(self.update_progress)
 
     def refresh_launch_activity(self, identity):
@@ -37,9 +39,10 @@ class BackupQueue(QObject):
 
     def add(self, game, action, settings):
         identity = game['Id']
-        if self.active and self.active[0]['Id'] == identity or any(job[0]['Id'] == identity for job in self.pending):
-            self.window.statusBar().showMessage('Save backup already queued for ' + game['Name'], 8000)
-            return
+        for index, job in enumerate(self.pending):
+            if job[0]['Id'] == identity:
+                self.pending[index] = (copy.deepcopy(game), copy.deepcopy(action), settings)
+                return
         self.pending.append((copy.deepcopy(game), copy.deepcopy(action), settings))
         self.states[identity] = Path(settings['state'])
         registry = getattr(self.window, 'background_tasks', None)
@@ -67,10 +70,15 @@ class BackupQueue(QObject):
             import fcntl
             state = Path(settings['state']); state.mkdir(parents=True, exist_ok=True)
             with (state / 'backup.lock').open('a') as lock:
+                started = time.monotonic()
+                self.progress.emit('Waiting for the local backup lock…')
                 fcntl.flock(lock, fcntl.LOCK_EX)
+                lock_seconds = time.monotonic() - started
                 for provider in providers:
                     if callable(getattr(provider, 'detect_running', None)) and provider.owns(game) and game['Id'] in provider.detect_running([game]):
                         raise ValueError('Close the game before backing up its saves.')
+                started = time.monotonic()
+                self.progress.emit('Updating save definition…')
                 from .definitions import sync_definitions
                 from playlite.library_storage import library_lock
                 with library_lock(self.window.data):
@@ -80,36 +88,30 @@ class BackupQueue(QObject):
                         raise ValueError('This game was removed before its queued backup started.')
                     sync_definitions([current], providers, settings)
                 context = resolve_context(game, action, providers)
-                return BackupEngine(settings).run(context, status=self.progress.emit)
+                context['game_id'] = game['Id']
+                definition_seconds = time.monotonic() - started
+                result = BackupEngine(settings).run(context, status=self.progress.emit, defer_cloud=True)
+                result.setdefault('timings', {}).update(lock_seconds=round(lock_seconds, 3), definition_seconds=round(definition_seconds, 3))
+                return result
         self._task = Task(work)
         self._task.signals.succeeded.connect(self.completed)
         self._task.signals.failed.connect(self.failed)
         QThreadPool.globalInstance().start(self._task)
-
-    def retry_upload(self, captured):
-        game, action, settings = captured
-        current = next((g for g in self.window.games if g['Id'] == game['Id']), None)
-        if current is None or self.window.game_detection.status(game['Id']) in ('Running','Launching'): return
-        mode=(current.get('LudusaviBackup') or {}).get('automatic','default')
-        if mode=='disabled' or not settings.get('cloud'): return
-        self.add(current, action, settings)
 
     @pyqtSlot(str)
     def update_progress(self, message):
         if not self.active:
             return
         game = self.active[0]
-        self.results[game['Id']] = {'status': message, 'cloud': 'Waiting' if message.startswith('Waiting') else 'In progress',
+        self.results[game['Id']] = {'status': message, 'local_saved': message == 'Local backup saved.', 'cloud': 'Not attempted',
                                     'details': message}
         self.window.statusBar().showMessage(game['Name'] + ': ' + message)
         registry = getattr(self.window, 'background_tasks', None)
         if registry is not None:
-            registry.update(self.task_ids[game['Id']], state='Waiting' if message.startswith('Waiting') else 'Uploading' if message.startswith('Uploading') else 'Running', summary=message)
+            registry.update(self.task_ids[game['Id']], state='Waiting' if message.startswith('Waiting') else 'Running', summary=message)
         self.refresh_launch_activity(game['Id'])
 
-    @pyqtSlot(object)
-    def completed(self, result):
-        game = self.active[0]
+    def record_result(self, game, result):
         result = dict(result, updated=datetime.now(timezone.utc).isoformat(timespec='seconds'))
         self.results[game['Id']] = result
         state = self.states.get(game['Id'])
@@ -125,21 +127,20 @@ class BackupQueue(QObject):
                 logging.exception('Could not record backup result')
         registry = getattr(self.window, 'background_tasks', None)
         if registry is not None:
-            registry.update(self.task_ids[game['Id']], state='Failed' if result['status'] == 'Backup failed' else 'Needs attention' if result.get('cloud') in ('Needs attention', 'Upload failed') else 'Complete',
-                summary=result['status'] + ' · Cloud: ' + result.get('cloud', 'Not attempted'), details=result.get('details', ''))
-        if result.get('cloud') == 'Upload failed':
-            attempt = self.upload_retries.get(game['Id'], 0)
-            if attempt < 3:
-                self.upload_retries[game['Id']] = attempt + 1
-                captured = copy.deepcopy(self.active)
-                retry_timer = QTimer(self); retry_timer.setSingleShot(True)
-                retry_timer.timeout.connect(lambda captured=captured, timer=retry_timer: (self.retry_upload(captured), timer.deleteLater()))
-                retry_timer.start(60000 * (attempt + 1))
-        elif result.get('cloud') == 'Uploaded': self.upload_retries.pop(game['Id'], None)
-        message = f"{game['Name']}: {result['status']}"
-        if result.get('cloud') not in ('Uploaded', 'Disabled', 'Not attempted'):
-            message += ' — cloud needs attention (see Save backup status)'
-        self.window.statusBar().showMessage(message, 15000)
+            if game['Id'] not in self.task_ids:
+                self.task_ids[game['Id']] = registry.update(title=game['Name'], kind='Save backup', state='Running', summary='Save backup')
+            registry.update(self.task_ids[game['Id']], state='Failed' if result['status'] == 'Backup failed' else 'Needs attention' if result.get('cloud') in ('Needs attention', 'Upload failed') else 'Queued' if result.get('cloud') == 'Queued' else 'Complete',
+                summary=result['status'] + ' · Cloud: ' + result.get('cloud', 'Not attempted'), details=result.get('details', '') + '\nTimings: ' + json.dumps(result.get('timings', {})))
+        return result
+
+    @pyqtSlot(object)
+    def completed(self, result):
+        game = self.active[0]
+        result = self.record_result(game, result)
+        if result.get('cloud_job'):
+            settings = self.active[2]
+            self.cloud_queue.add(copy.deepcopy(game), settings, result)
+        self.window.statusBar().showMessage(f"{game['Name']}: {result['status']}", 15000)
         self.active = None
         self._task = None
         self.refresh_launch_activity(game['Id'])
@@ -310,7 +311,7 @@ class Plugin(GenericPlugin):
             task.signals.succeeded.connect(lambda result: registry.update(identity, state='Complete', summary=f"Updated {len(result['updated'])} games; skipped {len(result['skipped'])}.", details=json.dumps(result, indent=2)))
             task.signals.failed.connect(lambda error: registry.update(identity, state='Failed', summary='Save definition sync failed.', details=error))
         task.signals.succeeded.connect(lambda result: window.statusBar().showMessage(
-            f"Save definitions synced: {len(result['updated'])}; skipped: {len(result['skipped'])}", 15000))
+            f"Save definitions synced: {len(result['updated'])}; skipped: {len(result['skipped'])}", 15000) if result['updated'] or result.get('config_backup') else None)
         task.signals.failed.connect(lambda error: window.statusBar().showMessage('Save definition update deferred: ' + error, 10000))
         # Retain tasks until their queued Qt callbacks finish.
         tasks = getattr(window, '_ludusavi_definition_tasks', None)
@@ -338,6 +339,7 @@ class Plugin(GenericPlugin):
         engine = BackupEngine(self.options())
         if (engine.config / 'config.yaml').is_file() and (engine.config / 'manifest.yaml').is_file():
             self.sync_definitions(window)
+            QTimer.singleShot(0, lambda: self.controller(window).cloud_queue.resume(self.options()))
 
     def after_game_updated(self, window, game):
         record=Path(self.options()['state'])/'detection-results.json'
@@ -401,7 +403,7 @@ class Plugin(GenericPlugin):
     def open_ludusavi(self, window, game, custom=False):
         try:
             controller = self.controller(window)
-            if controller.active or controller.pending:
+            if controller.active or controller.pending or controller.cloud_queue.active:
                 raise ValueError('Wait for queued save backups to finish before opening restore/configuration.')
             if window.game_detection.status(game['Id']) in ('Running', 'Launching'):
                 raise ValueError('Close the game before opening restore/configuration.')

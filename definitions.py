@@ -38,11 +38,17 @@ def definition_fingerprint(games, settings):
             manifest.update(chunk)
     ownership = engine.state / 'managed-definitions.json'
     inputs = {
-        'schema': 2,
+        'schema': 3,
         'config': str(engine.config.resolve()),
         'manifest': manifest.hexdigest(),
         'games': [{key: game.get(key) for key in
-                   ('Id', 'Name', 'PlayActions', 'InstallDirectory', 'MetadataIds', 'LudusaviBackup')}
+                   ('Id', 'Name', 'InstallDirectory')} |
+                  {'MetadataIds': {'SteamMetadata': (game.get('MetadataIds') or {}).get('SteamMetadata')},
+                   'LudusaviBackup': {key: value for key, value in (game.get('LudusaviBackup') or {}).items()
+                                      if key in ('name', 'prefix', 'files', 'registry')},
+                   'PlayActions': [{key: action.get(key) for key in
+                    ('Integration', 'GameId', 'Prefix', 'InstallDirectory', 'IsVM', 'Environment')}
+                    for action in game.get('PlayActions', [])]}
                   for game in games],
         'definitions': {key: config.get(key) for key in ('customGames', 'roots', 'redirects')},
         'managed': json.loads(ownership.read_text()) if ownership.exists() else {},
@@ -70,7 +76,8 @@ def sync_definitions(games, providers, settings, reconcile=False):
     config = engine.config / 'config.yaml'
     original = config.read_bytes()
     data = yaml.load(original, Loader=yaml.CSafeLoader) or {}
-    manifest = yaml.load((engine.config / 'manifest.yaml').read_text(), Loader=yaml.CSafeLoader) or {}
+    from .cache import cached_yaml
+    manifest = cached_yaml(engine.config / 'manifest.yaml')
     entries = data.setdefault('customGames', [])
     engine.state.mkdir(parents=True, exist_ok=True)
     ownership = engine.state / 'managed-definitions.json'
@@ -138,7 +145,8 @@ def sync_definitions(games, providers, settings, reconcile=False):
                 root={'store':'otherWine','path':prefix}
                 if root not in roots: roots.append(root)
     updated = [{'id': game['Id'], 'game': game['Name'], 'name': title,
-                'file_rules': len(entry['files'])} for game, title, entry, old in candidates]
+                'file_rules': len(entry['files'])} for game, title, entry, old in candidates if entry != old]
+    unchanged = [game['Name'] for game, title, entry, old in candidates if entry == old]
     backup = None
     if yaml.load(original, Loader=yaml.CSafeLoader) != data:
         backup = engine.state / ('config-before-definitions-' + uuid.uuid4().hex + '.yaml')
@@ -154,7 +162,7 @@ def sync_definitions(games, providers, settings, reconcile=False):
             temporary.replace(config)
         finally:
             temporary.unlink(missing_ok=True)
-    result = {'updated': updated, 'skipped': skipped, 'config_backup': str(backup) if backup else None}
+    result = {'updated': updated, 'unchanged': unchanged, 'skipped': skipped, 'config_backup': str(backup) if backup else None}
     record = engine.state / 'definitions-result.json'
     previous = json.loads(record.read_text()).get('updated', []) if record.exists() else []
     identities = {row['id'] for row in updated}
@@ -177,7 +185,8 @@ def rule_sources(game, definition, settings, context):
     """Explain saved rules using the same manifest and emulator readers as sync."""
     engine = BackupEngine(settings)
     try:
-        manifest = yaml.load((engine.config / 'manifest.yaml').read_text(), Loader=yaml.CSafeLoader) or {}
+        from .cache import cached_yaml
+        manifest = cached_yaml(engine.config / 'manifest.yaml')
     except (OSError, ValueError, yaml.YAMLError):
         manifest = {}
     title = definition.get('name') or title_for(game, manifest, [])
